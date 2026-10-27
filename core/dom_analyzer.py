@@ -3,58 +3,78 @@ import re
 import requests
 
 DYNAMIC_CLASS_RE = re.compile(r"^(?:css|sc|emotion|e|jsx|svelte|tw)-[a-zA-Z0-9_-]+$|^[a-zA-Z]{1,3}[0-9]{3,}$")
+INTERACTIVE_TAGS = ("button", "input", "select", "textarea", "a", "form")
+TEXT_TAGS = ("button", "a", "label", "span", "li", "option", "h1", "h2", "h3")
+SEMANTIC_ATTRS = ("data-testid", "data-qa", "data-cy", "data-test", "role", "aria-label", "placeholder", "name", "id")
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/134.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 class _DOMParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.nodes = []
-        self._tag = None
-        self._attrs = {}
-        self._text = []
+        self._stack = []
 
     def handle_starttag(self, tag, attrs):
         t = tag.lower()
-        attr_map = {k.lower(): (v or "") for k, v in attrs}
-        if t in ("button", "input", "select", "textarea", "a", "form"):
-            self._tag = t
-            self._attrs = attr_map
-            self._text = []
-            if t == "input":
-                self._flush()
+        if t in ("script", "style", "meta", "link", "head", "svg", "path", "noscript"):
+            return
+        attr_map = {k.lower(): (v or "") for k, v in attrs if k}
+        has_semantic = any(attr_map.get(a, "").strip() for a in SEMANTIC_ATTRS)
+        if t not in INTERACTIVE_TAGS and not has_semantic:
+            return
 
-    def handle_data(self, data):
-        if self._tag:
-            self._text.append(data.strip())
-
-    def handle_endtag(self, tag):
-        if self._tag and tag.lower() == self._tag:
-            if self._tag != "input":
-                self._flush()
-            self._tag = None
-
-    def _flush(self):
-        text = " ".join(x for x in self._text if x).strip()[:60]
-        self.nodes.append({
-            "tag": self._tag,
-            "id": self._attrs.get("id", ""),
-            "name": self._attrs.get("name", ""),
-            "type": self._attrs.get("type", ""),
+        node = {
+            "tag": t,
+            "id": attr_map.get("id", ""),
+            "name": attr_map.get("name", ""),
+            "type": attr_map.get("type", ""),
             "testid": (
-                self._attrs.get("data-testid")
-                or self._attrs.get("data-qa")
-                or self._attrs.get("data-cy")
-                or self._attrs.get("data-test")
+                attr_map.get("data-testid")
+                or attr_map.get("data-qa")
+                or attr_map.get("data-cy")
+                or attr_map.get("data-test")
                 or ""
             ),
-            "aria_label": self._attrs.get("aria-label", ""),
-            "placeholder": self._attrs.get("placeholder", ""),
-            "role": self._attrs.get("role", ""),
-            "href": self._attrs.get("href", ""),
-            "class_name": self._attrs.get("class", ""),
-            "text": text,
-        })
-        self._tag = None
+            "aria_label": attr_map.get("aria-label", ""),
+            "placeholder": attr_map.get("placeholder", ""),
+            "role": attr_map.get("role", ""),
+            "href": attr_map.get("href", "") or attr_map.get("action", ""),
+            "class_name": attr_map.get("class", ""),
+            "text": attr_map.get("value", "").strip()[:60],
+            "_collect_text": t in TEXT_TAGS or bool(attr_map.get("role") or attr_map.get("data-testid")),
+        }
+        self.nodes.append(node)
+        if t not in ("input", "img", "br", "hr"):
+            self._stack.append(node)
+
+    def handle_data(self, data):
+        if not self._stack:
+            return
+        chunk = data.strip()
+        if not chunk:
+            return
+        for node in reversed(self._stack):
+            if node.get("_collect_text"):
+                cur = node["text"]
+                node["text"] = (f"{cur} {chunk}".strip() if cur else chunk)[:60]
+                break
+
+    def handle_endtag(self, tag):
+        t = tag.lower()
+        for idx in range(len(self._stack) - 1, -1, -1):
+            if self._stack[idx]["tag"] == t:
+                self._stack.pop(idx)
+                break
 
 
 def _stable_classes(class_str):
@@ -76,6 +96,8 @@ def rank_element(el):
     aria = el.get("aria_label", "").strip()
     placeholder = el.get("placeholder", "").strip()
     el_type = el.get("type", "").strip()
+    role = el.get("role", "").strip()
+    href = el.get("href", "").strip()
     text = el.get("text", "").strip()
     stable_cls = _stable_classes(el.get("class_name", ""))
 
@@ -114,6 +136,21 @@ def rank_element(el):
             score = 82
             strategy = "placeholder"
 
+    if role:
+        css_list.append(f"{tag}[role='{role}']")
+        if score < 76:
+            score = 76
+            strategy = "role"
+
+    if href and not href.startswith(("javascript:", "#")):
+        clean_href = href.split("?")[0].replace("'", "\\'")[:60]
+        if clean_href:
+            attr_name = "action" if tag == "form" else "href"
+            css_list.append(f"{tag}[{attr_name}*='{clean_href}']")
+            if score < 75:
+                score = 75
+                strategy = attr_name
+
     if stable_cls:
         css_list.append(f"{tag}.{'.'.join(stable_cls)}")
         if score < 74:
@@ -128,7 +165,7 @@ def rank_element(el):
 
     if testid:
         xpath = f"//{tag}[@data-testid='{testid}']"
-    elif el_id:
+    elif el_id and not re.search(r"\d{4,}", el_id):
         xpath = f"//{tag}[@id='{el_id}']"
     elif text and len(text) <= 45 and "'" not in text:
         xpath = f"//{tag}[normalize-space()='{text}']"
@@ -139,13 +176,17 @@ def rank_element(el):
         xpath = f"//{tag}[contains(@aria-label, '{aria[:30]}')]"
     elif name:
         xpath = f"//{tag}[@name='{name}']"
+    elif href and not href.startswith(("javascript:", "#")) and "'" not in href:
+        xpath = f"//{tag}[contains(@href, '{href.split('?')[0][:45]}')]"
+    elif role:
+        xpath = f"//{tag}[@role='{role}']"
     else:
         xpath = f"//{tag}"
 
-    primary = css_list[0] if css_list else tag
+    primary = css_list[0] if css_list else xpath
     fallback = css_list[1] if len(css_list) > 1 else xpath
 
-    raw_label = testid or el_id or name or aria or placeholder or text or f"{tag}_el"
+    raw_label = testid or el_id or name or aria or placeholder or text or role or href.strip("/").split("/")[-1] or f"{tag}_el"
     ident = re.sub(r"[^a-zA-Z0-9_]", "_", raw_label.lower()).strip("_")[:32] or tag
     if ident[0].isdigit():
         ident = f"el_{ident}"
@@ -153,7 +194,7 @@ def rank_element(el):
     return {
         "ident": ident,
         "tag": tag,
-        "label": text or aria or placeholder or name or el_id or testid or tag,
+        "label": text or aria or placeholder or name or el_id or testid or role or tag,
         "primary_css": primary,
         "fallback": fallback,
         "xpath": xpath,
@@ -165,7 +206,12 @@ def rank_element(el):
 def analyze_live_dom(driver):
     js = """
     const out = [];
-    const q = 'button, input, select, textarea, a[role="button"], a[href*="login"], a[href*="signup"], form';
+    const q = [
+        'button', 'input', 'select', 'textarea', 'a[href]', 'form',
+        '[data-testid]', '[data-qa]', '[data-cy]', '[data-test]',
+        '[role="button"]', '[role="link"]', '[role="tab"]', '[role="searchbox"]', '[role="menuitem"]',
+        '[aria-label]'
+    ].join(', ');
     document.querySelectorAll(q).forEach(el => {
         const r = el.getBoundingClientRect();
         if (r.width === 0 || r.height === 0) return;
@@ -174,11 +220,11 @@ def analyze_live_dom(driver):
             id: el.id || '',
             name: el.getAttribute('name') || '',
             type: el.getAttribute('type') || '',
-            testid: el.getAttribute('data-testid') || el.getAttribute('data-qa') || el.getAttribute('data-cy') || '',
+            testid: el.getAttribute('data-testid') || el.getAttribute('data-qa') || el.getAttribute('data-cy') || el.getAttribute('data-test') || '',
             aria_label: el.getAttribute('aria-label') || '',
             placeholder: el.getAttribute('placeholder') || '',
             role: el.getAttribute('role') || '',
-            href: el.getAttribute('href') || '',
+            href: el.getAttribute('href') || el.getAttribute('action') || '',
             class_name: (typeof el.className === 'string' ? el.className : ''),
             text: (el.innerText || el.value || '').trim().slice(0, 60)
         });
@@ -192,14 +238,16 @@ def analyze_live_dom(driver):
     return _deduplicate(ranked)
 
 
-def analyze_static_html(url, timeout=12):
-    r = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/134.0.0.0"},
-        timeout=timeout,
-    )
+def fetch_static_page(url, timeout=12):
+    r = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout)
+    return r.text, r.url
+
+
+def analyze_static_html(url, timeout=12, html=None):
+    if html is None:
+        html, _ = fetch_static_page(url, timeout=timeout)
     parser = _DOMParser()
-    parser.feed(r.text)
+    parser.feed(html)
     ranked = [rank_element(e) for e in parser.nodes]
     ranked = [x for x in ranked if x["score"] >= 65]
     ranked.sort(key=lambda x: x["score"], reverse=True)

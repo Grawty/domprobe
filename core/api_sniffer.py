@@ -1,7 +1,17 @@
+import base64
 import json
+import re
+from urllib.parse import urljoin, urlparse
 
-IGNORE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf", ".css", ".ico", ".webp")
-IGNORE_HOSTS = ("google-analytics.com", "doubleclick.net", "googletagmanager.com", "facebook.net", "hotjar.com", "sentry.io")
+IGNORE_EXT = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2", ".ttf",
+    ".css", ".ico", ".webp", ".js", ".mjs", ".map", ".mp3", ".mp4", ".html",
+)
+IGNORE_HOSTS = (
+    "google-analytics.com", "doubleclick.net", "googletagmanager.com",
+    "facebook.net", "hotjar.com", "sentry.io", "w3.org", "schema.org",
+    "ogp.me", "googleapis.com", "gstatic.com", "cookielaw.org", "onetrust.com",
+)
 
 
 def install_network_hook(driver):
@@ -96,6 +106,46 @@ def collect_live_apis(driver):
     return list(endpoints.values())
 
 
+def extract_static_apis(html, base_url=""):
+    if not html:
+        return []
+
+    blobs = [html]
+    for m in re.finditer(r"<script[^>]*>([A-Za-z0-9+/=\s]{40,})</script>", html):
+        raw_b64 = re.sub(r"\s+", "", m.group(1))
+        try:
+            decoded = base64.b64decode(raw_b64).decode("utf-8", errors="ignore")
+            if "{" in decoded or "http" in decoded:
+                blobs.append(decoded)
+        except Exception:
+            pass
+
+    endpoints = {}
+    full_url_re = re.compile(r"https?://[a-zA-Z0-9._-]+(?:/[a-zA-Z0-9._~:/?#\[\]@!$&()*+,;=%-]*)?")
+    rel_api_re = re.compile(r"""["']((?:/api/|/v1/|/v2/|/v3/|/graphql|/pathfinder/)[^"'\s<>]{1,120})["']""")
+
+    for text in blobs:
+        for m in full_url_re.finditer(text):
+            url = m.group(0).rstrip("',\";)}]>\\")
+            if _is_api_candidate(url, "GET"):
+                method = "POST" if any(x in url.lower() for x in ("graphql", "pathfinder", "token", "login", "auth")) else "GET"
+                key = f"{method} {url.split('?')[0]}"
+                if key not in endpoints:
+                    endpoints[key] = _normalize_entry(method, url, {}, None)
+
+        if base_url:
+            for m in rel_api_re.finditer(text):
+                rel = m.group(1)
+                url = urljoin(base_url, rel)
+                if not _is_ignored(url):
+                    method = "POST" if any(x in url.lower() for x in ("graphql", "pathfinder", "token", "login", "auth")) else "GET"
+                    key = f"{method} {url.split('?')[0]}"
+                    if key not in endpoints:
+                        endpoints[key] = _normalize_entry(method, url, {}, None)
+
+    return list(endpoints.values())
+
+
 def parse_har_file(har_path):
     with open(har_path, "r", encoding="utf-8", errors="ignore") as f:
         data = json.load(f)
@@ -152,6 +202,10 @@ def _is_api_candidate(url, method="GET"):
         return False
     u = url.lower()
     if method in ("POST", "PUT", "PATCH", "DELETE"):
+        return True
+    parsed = urlparse(u)
+    host = parsed.netloc
+    if any(host.startswith(p) or f".{p}" in host for p in ("api.", "spclient.", "api-partner.", "graphql.")):
         return True
     tokens = ("/api/", "/v1/", "/v2/", "/v3/", "graphql", "pathfinder", ".json", "token", "auth", "login", "signup", "query")
     return any(t in u for t in tokens)
